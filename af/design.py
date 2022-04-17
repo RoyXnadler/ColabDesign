@@ -81,7 +81,7 @@ class mk_design_model:
     self._config = cfg
 
     # setup model
-    self._model_params = [data.get_model_haiku_params(model_name=model_name, data_dir=".")]
+    self._model_params = [data.get_model_haiku_params(model_name=model_name, data_dir="../data")]
     self._runner = model.RunModel(self._config, self._model_params[0], is_training=True)
 
     # load the other model_params
@@ -94,7 +94,7 @@ class mk_design_model:
       model_names = model_names[:self.args["num_models"]]
 
     for model_name in model_names:
-      params = data.get_model_haiku_params(model_name, '.')
+      params = data.get_model_haiku_params(model_name, "../data")
       self._model_params.append({k: params[k] for k in self._runner.params.keys()})
 
     # define gradient function
