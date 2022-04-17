@@ -1,7 +1,7 @@
 import numpy as np
 import jax
 import jax.numpy as jnp
-from jax.example_libraries.optimizers import sgd
+from jax.experimental.optimizers import sgd
 
 def clear_mem():
   backend = jax.lib.xla_bridge.get_backend()
