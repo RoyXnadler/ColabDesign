@@ -281,12 +281,15 @@ def soft_seq(seq_logits, temp=1.0, hard=True):
   else:
     return seq_soft
 
-def update_seq(seq, inputs, seq_1hot=None, seq_pssm=None, msa_input=None):
+def update_seq(seq, inputs, seq_1hot=None, seq_pssm=None, msa_input=None, real_msa=False):
   '''update the sequence features'''
-  
-  if seq_1hot is None: seq_1hot = seq 
+
+  if seq_1hot is None: seq_1hot = seq
   if seq_pssm is None: seq_pssm = seq
-  msa_feat = jnp.zeros_like(inputs["msa_feat"]).at[...,0:20].set(seq_1hot).at[...,25:45].set(seq_pssm)
+  if real_msa:
+    msa_feat = inputs["msa_feat"].at[:, 0, ..., 0:20].set(seq_1hot).at[:, 0, ..., 25:45].set(seq_pssm)
+  else:
+    msa_feat = jnp.zeros_like(inputs["msa_feat"]).at[..., 0:20].set(seq_1hot).at[..., 25:45].set(seq_pssm)
   if seq.ndim == 3:
     target_feat = jnp.zeros_like(inputs["target_feat"]).at[...,1:21].set(seq[0])
   else:

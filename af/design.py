@@ -12,6 +12,7 @@ from alphafold.data import pipeline, templates
 from alphafold.model import data, config, model, modules
 from alphafold.common import residue_constants
 
+from alphafold.data.parsers import Msa
 from alphafold.model import all_atom
 from alphafold.model import folding
 
@@ -25,15 +26,18 @@ from matplotlib import animation
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 
+
 class mk_design_model:
   ######################################
   # model initialization
   ######################################
   def __init__(self, num_seq=1, protocol="fixbb",
                num_models=1, model_mode="sample", model_parallel=False,
-               num_recycles=0, recycle_mode="sample",
+               num_recycles=0, recycle_mode="sample", real_msa=False,
                use_templates=None):
     
+    self.real_msa = real_msa
+
     # decide if templates should be used
     if use_templates is None:
       use_templates = True if protocol=="binder" else False
@@ -112,6 +116,30 @@ class mk_design_model:
     if protocol == "hallucination":  self.prep_inputs = self._prep_hallucination
     if protocol == "binder":         self.prep_inputs = self._prep_binder
 
+    import shutil
+    from alphafold.data.tools import hhsearch
+    from alphafold.data import templates
+    self.process_msa_for_sequence_file = pipeline.DataPipeline(
+      jackhmmer_binary_path=shutil.which('jackhmmer'),
+      hhblits_binary_path=shutil.which('hhblits'),
+      uniref90_database_path="../data/uniref90/uniref90.fasta",  # _less
+      mgnify_database_path="../data/mgnify/mgy_clusters_2018_12.fa",  # _less
+      bfd_database_path=None,
+      uniclust30_database_path=None,
+      small_bfd_database_path="../data/small_bfd/bfd-first_non_consensus_sequences.fasta",
+      template_searcher=hhsearch.HHSearch(
+        binary_path=shutil.which('hhsearch'),
+        databases=["../data/pdb70/pdb70"]),
+      template_featurizer=templates.HhsearchHitFeaturizer(
+        mmcif_dir="../data/pdb_mmcif/mmcif_files",
+        max_template_date="2021-08-01",
+        max_hits=20,
+        kalign_binary_path=shutil.which('kalign'),
+        release_dates_path=None,
+        obsolete_pdbs_path="../data/pdb_mmcif/obsolete.dat"),
+      use_small_bfd=True
+    ).process
+
   ######################################
   # setup gradient
   ######################################
@@ -128,7 +156,7 @@ class mk_design_model:
       seq_logits = params["seq_logits"] - params["seq_logits"].mean(-1,keepdims=True)
 
       # shuffle msa
-      if self.args["num_seq"] > 1:
+      if not self.real_msa and self.args["num_seq"] > 1:
         i = jax.random.randint(key,[],0,seq_logits.shape[0])
         seq_logits = seq_logits.at[0].set(seq_logits[i]).at[i].set(seq_logits[0])
 
@@ -143,13 +171,13 @@ class mk_design_model:
       seq_pseudo = jnp.where(opt["hard"], seq_hard, seq_pseudo)
       
       # save for aux output
-      aux = {"seq":seq_hard,"seq_pseudo":seq_pseudo}
+      aux = {"seq":seq_hard, "seq_pseudo":seq_pseudo}
 
       # entropy loss for msa
-      if self.args["num_seq"] > 1:
+      if not self.real_msa and self.args["num_seq"] > 1:
         seq_prf = seq_hard.mean(0)
         losses["msa_ent"] = -(seq_prf * jnp.log(seq_prf + 1e-8)).sum(-1).mean()
-      
+
       if self.protocol == "binder":
         # concatenate target and binder sequence
         seq_target = jax.nn.one_hot(self._batch["aatype"][:self._target_len],20)
@@ -159,9 +187,22 @@ class mk_design_model:
       
       if self.protocol == "hallucination" and self._copies > 1:
         seq_pseudo = jnp.concatenate([seq_pseudo]*self._copies, 1)
-      
+
+      # cross entropy loss against msa sequences
+      if self.real_msa and self.args["num_seq"] > 1:
+        batch_mean_feat = inputs["msa_feat"].mean(0)[..., :20]
+        # Distribution of amino acids at each offset
+        msa_seq_prf = batch_mean_feat[1:].mean(0)
+        # Cross entropy of soft amino distribution with relation to the background
+        losses["msa_ent"] = -(msa_seq_prf * jnp.log(seq_soft[0] + 1e-8)).sum(-1).mean()
+
       # update sequence
-      update_seq(seq_pseudo, inputs)
+      update_seq(seq_pseudo, inputs, real_msa=self.real_msa)
+
+      # Shuffle OTHER rows of msa (top row belongs to the seq)
+      if self.real_msa and self.args["num_seq"] > 2:
+        i = jax.random.randint(key, [], 2, inputs["msa_feat"].shape[0])
+        inputs["msa_feat"] = inputs["msa_feat"].at[1].set(inputs["msa_feat"][i]).at[i].set(inputs["msa_feat"][1])
       
       # update amino acid sidechain identity
       N,L = inputs["aatype"].shape[:2]
@@ -258,14 +299,34 @@ class mk_design_model:
     feature_dict = {
         **pipeline.make_sequence_features(sequence=sequence, description="none",
                                           num_res=length),
-        **pipeline.make_msa_features(msas=[length*[sequence]],
-                                     deletion_matrices=[num_seq*[[0]*length]])
+        **pipeline.make_msa_features(msas=[
+          Msa(sequences=num_seq * [sequence],
+              deletion_matrix=num_seq*[[0]*length],
+              descriptions=num_seq * ["placeholder"])
+        ])
         }
     if template_features is not None: feature_dict.update(template_features)    
     inputs = self._runner.process_features(feature_dict, random_seed=0)
     if num_seq > 1:
       inputs["msa_row_mask"] = jnp.ones_like(inputs["msa_row_mask"])
       inputs["msa_mask"] = jnp.ones_like(inputs["msa_mask"])
+    return inputs
+
+  def _prep_real_msa_features(self, init_sequence: str):
+    '''process features'''
+    from tempfile import NamedTemporaryFile, TemporaryDirectory
+    with TemporaryDirectory(suffix=".fasta") as temp_msa_dir:
+      with NamedTemporaryFile(mode='w', suffix=".fasta") as temp_fasta:
+        temp_fasta.write(f">temp\n{init_sequence}\n")
+        temp_fasta.flush()
+        feature_dict = self.process_msa_for_sequence_file(temp_fasta.name, temp_msa_dir)
+
+    inputs = self._runner.process_features(feature_dict, random_seed=0)
+
+    # TODO: should we really remove the masking?1
+    inputs["msa_row_mask"] = jnp.ones_like(inputs["msa_row_mask"])
+    inputs["msa_mask"] = jnp.ones_like(inputs["msa_mask"])
+
     return inputs
 
   def _prep_pdb(self, pdb_filename, chain=None):
@@ -281,8 +342,7 @@ class mk_design_model:
 
     template_features = {"template_aatype":jax.nn.one_hot(protein_obj.aatype[has_ca],22)[None],
                          "template_all_atom_masks":protein_obj.atom_mask[has_ca][None],
-                         "template_all_atom_positions":protein_obj.atom_positions[has_ca][None],
-                         "template_domain_names":np.asarray(["None"])}
+                         "template_all_atom_positions":protein_obj.atom_positions[has_ca][None]}
     return {"batch":batch,
             "template_features":template_features,
             "residue_index": protein_obj.residue_index[has_ca]}
@@ -337,18 +397,25 @@ class mk_design_model:
   def _prep_fixbb(self, pdb_filename, chain=None, **kwargs):
     '''prep inputs for fixed backbone design'''
     pdb = self._prep_pdb(pdb_filename, chain=chain)
-    length = pdb["residue_index"].shape[0]
-    self._inputs = self._prep_features(length, pdb["template_features"])
-    # update residue index from pdb
-    self._inputs["residue_index"][:,:] = pdb["residue_index"]
     self._batch = pdb["batch"]
-    self._len = length
+    self._len = pdb["residue_index"].shape[0]
     self._k = -1
+
     # set weights
-    self._default_weights = {"msa_ent":0.01,"dgram_cce":1.0,
-                             "fape":0.0,"pae":0.1,"plddt":0.1}
+    self._default_weights = {"msa_ent": 0.01, "dgram_cce": 1.0, "fape": 0.0, "pae": 0.1, "plddt": 0.1}
     self.restart(**kwargs)
-    
+
+    # Process the initialized sequence generated in init, NOT the real sequence
+    if not self.real_msa:
+      self._inputs = self._prep_features(self._len, pdb["template_features"])
+    else:
+      msa_features = self._prep_real_msa_features("".join(
+        [order_restype[a] for a in self._params["seq_logits"][0].argmax(-1).tolist()]))
+      # update residue index from pdb & the msa pipeline
+      self._inputs = {**msa_features, **pdb["template_features"]}
+
+    self._inputs["residue_index"][:, :] = pdb["residue_index"]
+
   def _prep_hallucination(self, length=100, copies=1, **kwargs):
     '''prep inputs for hallucination'''
     self._len = length
@@ -375,7 +442,7 @@ class mk_design_model:
   def _init_seq(self, x=None):
     '''initialize sequence'''
     self._key, _key = jax.random.split(self._key)
-    shape = (self.args["num_seq"],self._len,20)
+    shape = (1, self._len, 20) if self.real_msa else (self.args["num_seq"],self._len,20)
     if isinstance(x, np.ndarray) or isinstance(x, jnp.ndarray):
       y = jnp.broadcast_to(x, shape)
     elif isinstance(x, str):

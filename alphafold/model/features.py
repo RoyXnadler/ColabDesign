@@ -14,14 +14,14 @@
 
 """Code to generate processed features."""
 import copy
-from typing import List, Mapping, Tuple
+from typing import List, Tuple, Dict
 from alphafold.model.tf import input_pipeline
 from alphafold.model.tf import proteins_dataset
 import ml_collections
 import numpy as np
 import tensorflow.compat.v1 as tf
 
-FeatureDict = Mapping[str, np.ndarray]
+FeatureDict = Dict[str, np.ndarray]
 
 
 def make_data_config(

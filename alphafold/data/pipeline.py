@@ -127,20 +127,26 @@ class DataPipeline:
                use_precomputed_msas: bool = False):
     """Initializes the data pipeline."""
     self._use_small_bfd = use_small_bfd
+    jackhammer_kwargs = dict(
+        n_cpu=16, e_value=0.1, n_iter=3, filter_f1=0.05, filter_f2=0.005, filter_f3=0.0005
+    )
     self.jackhmmer_uniref90_runner = jackhmmer.Jackhmmer(
         binary_path=jackhmmer_binary_path,
-        database_path=uniref90_database_path)
+        database_path=uniref90_database_path,
+        **jackhammer_kwargs)
     if use_small_bfd:
       self.jackhmmer_small_bfd_runner = jackhmmer.Jackhmmer(
           binary_path=jackhmmer_binary_path,
-          database_path=small_bfd_database_path)
+          database_path=small_bfd_database_path,
+          **jackhammer_kwargs)
     else:
       self.hhblits_bfd_uniclust_runner = hhblits.HHBlits(
           binary_path=hhblits_binary_path,
           databases=[bfd_database_path, uniclust30_database_path])
     self.jackhmmer_mgnify_runner = jackhmmer.Jackhmmer(
         binary_path=jackhmmer_binary_path,
-        database_path=mgnify_database_path)
+        database_path=mgnify_database_path,
+        **jackhammer_kwargs)
     self.template_searcher = template_searcher
     self.template_featurizer = template_featurizer
     self.mgnify_max_hits = mgnify_max_hits
